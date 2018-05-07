@@ -1,32 +1,31 @@
-use std::cell::Cell;
-use std::borrow::Borrow;
-use std::cmp::max;
+mod murmurhash2;
+mod arena;
+
 use std::hash::{Hash, Hasher, BuildHasher};
-use std::iter::FromIterator;
-use std::mem::{self, replace};
+use std::mem;
 use std::ptr;
 use std::collections::hash_map::RandomState;
 use std::marker::PhantomData;
-mod murmurhash2;
+use std::slice;
 
-pub type Addr = usize;
+use arena::{Addr, Handler, Arena};
+
+
 pub type HashKey = u64;
 
-
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 enum Bucket {
-    Entry((HashKey, Addr)),
-    Vacant
+    Vacant,
+    Occupied(HashKey, Addr)
 }
 
 const INITIAL_TABLE_SIZE: usize = 1_024;
 const DEFAULT_HEAP_CAPACITY: usize = 1_024 * 128;
 
-#[derive(Clone)]
 pub struct HashMap<V, S=RandomState> {
     hash_builder: S,
     key_addr: Vec<Bucket>,
-    heap: Vec<u8>,
+    arena: Arena,
     data: PhantomData<V>,
 }
 
@@ -43,7 +42,7 @@ impl<V, S> HashMap<V, S> {
         HashMap {
             hash_builder,
             key_addr: vec![Bucket::Vacant; INITIAL_TABLE_SIZE],
-            heap: Vec::with_capacity(DEFAULT_HEAP_CAPACITY),
+            arena: Arena::new(),
             data: PhantomData,
         }
     }
@@ -57,114 +56,158 @@ impl<V, S> Default for HashMap<V, S>
 }
 
 
-struct Probe<'a> {
-    key_addr: &'a mut [Bucket],
-    bucket_addr: usize
+struct Probe {
+    dist: usize,
+    bucket_addr: usize,
+    mask: usize
+}
+
+impl Probe {
+    fn advance(&mut self) -> usize {
+        self.dist += 1;
+        self.bucket_addr = (self.bucket_addr + 1) & self.mask;
+        self.bucket_addr
+    }
 }
 
 
-// copy pasted from the std hash table.
-/*
-fn robin_hood<'a, V: 'a>(bucket: FullBucketMut<'a, K, V>,
-                        mut displacement: usize,
-                        mut hash: SafeHash,
-                        mut key: &[u8],
-                        mut val: V)
-                        -> FullBucketMut<'a, K, V> {
-    let size = bucket.table().size();
-    let raw_capacity = bucket.table().capacity();
+fn read_key(data: &[u8]) -> (&[u8], usize) {
+    unimplemented!();
+}
 
-    // There can be at most `size - dib` buckets to displace, because
-    // in the worst case, there are `size` elements and we already are
-    // `displacement` buckets away from the initial one.
-    let idx_end = (bucket.index() + size - bucket.displacement()) % raw_capacity;
 
-    // Save the *starting point*.
-    let mut bucket = bucket.stash();
+pub struct NotPresentEntry<'a, V: Copy> {
+    inner: NotPresentEntryCases<'a, V>
+}
 
-    loop {
-        let (old_hash, old_key, old_val) = bucket.replace(hash, key, val);
-        hash = old_hash;
-        key = old_key;
-        val = old_val;
+impl<'a, V:Copy> NotPresentEntry<'a, V> {
+    fn new(cases: NotPresentEntryCases<'a, V>) -> Self {
+        NotPresentEntry {
+            inner: cases,
+        }
+    }
+}
 
-        loop {
-            displacement += 1;
-            let probe = bucket.next();
-            debug_assert!(probe.index() != idx_end);
+enum NotPresentEntryCases<'a, V>  where V: Copy {
+    VacantEntry(&'a mut Arena, &'a mut Bucket, PhantomData<V>),
+    KickableEntry(&'a mut Arena, usize, &'a mut [Bucket], PhantomData<V>)
+}
 
-            let full_bucket = match probe.peek() {
-                Empty(bucket) => {
-                    // Found a hole!
-                    let bucket = bucket.put(hash, key, val);
-                    // Now that it's stolen, just read the value's pointer
-                    // right out of the table! Go back to the *starting point*.
-                    //
-                    // This use of `into_table` is misleading. It turns the
-                    // bucket, which is a FullBucket on top of a
-                    // FullBucketMut, into just one FullBucketMut. The "table"
-                    // refers to the inner FullBucketMut in this context.
-                    return bucket.into_table();
-                }
-                Full(bucket) => bucket,
-            };
+pub enum Entry<'a, V:'a> where V: Copy {
+    NotPresent(NotPresentEntry<'a, V>),
+    Present(Handler<'a, V>)
+}
 
-            let probe_displacement = full_bucket.displacement();
-
-            bucket = full_bucket;
-
-            // Robin hood! Steal the spot.
-            if probe_displacement < displacement {
-                displacement = probe_displacement;
-                break;
+impl<'a, V:'a> Entry<'a, V:'a> {
+    fn or_insert(mut self, default_value: V) -> Handler<'a, V> {
+        match self {
+            Entry::Present(handler) => handler,
+            Entry::NotPresent(entry) => {
+                entry.insert(default_value)
             }
         }
     }
 }
-*/
-
-impl<'a> Iterator for Probe<'a> {
-    type Item = &'a mut Bucket;
-
-    fn next(&mut self) -> Option<<Self as Iterator>::Item> {
-        unimplemented!();
-    }
-}
 
 impl<V, S> HashMap<V, S>
-    where S: BuildHasher {
+    where S: BuildHasher, V: Copy {
 
-    pub fn insert(&mut self, key: &str, value: V) -> Option<V> {
-        self.reserve(1);
-        unimplemented!("error");
+    fn capacity(&self) -> usize {
+        self.key_addr.len()
+    }
+
+    fn probe(&self, hash: u64) -> Probe {
+        let mask = self.capacity() - 1;
+        Probe {
+            dist: 0,
+            bucket_addr: (hash as usize) & mask,
+            mask
+        }
     }
 
     fn reserve(&mut self, additional_capacity: usize) {
         unimplemented!();
     }
 
-    fn make_hash(&self, key: &str) -> HashKey {
+    fn make_hash(&self, key: &[u8]) -> HashKey {
         let mut hasher: S::Hasher = self.hash_builder.build_hasher();
-        hasher.write(key.as_bytes());
+        hasher.write(key);
         hasher.finish()
     }
 
-    fn probe(&self, hash: HashKey) -> Probe {
-        unimplemented!()
+    fn dist(&self, bucket_id: usize, hash: u64) -> usize {
+        let target_pos: usize = (hash as usize) & (self.capacity() - 1);
+        if bucket_id >= target_pos {
+            bucket_id - target_pos
+        } else {
+            self.capacity() + bucket_id - target_pos
+        }
     }
 
-    pub fn get(&self, key: &str) -> Option<V> {
+    #[inline(always)]
+    fn entry(&mut self, key: &[u8]) -> Entry<V> {
         let hash = self.make_hash(key);
-        for bucket in self.probe(hash) {
-            match bucket {
+        let mut probe = self.probe(hash);
+        for probing_distance in 0.. {
+            let bucket_addr = probe.advance();
+            match self.key_addr[bucket_addr] {
                 Bucket::Vacant => {
-                    return None;
+                    let vacant_entry = NotPresentEntryCases::VacantEntry(&mut self.arena, &mut self.key_addr[bucket_addr], PhantomData);
+                    return Entry::NotPresent(NotPresentEntry::new(vacant_entry));
                 }
-                Bucket::Entry((HashKey, Addr)) => {
-                    unimplemented!()
+                Bucket::Occupied(in_place_hash_key, addr) => {
+                    if in_place_hash_key == hash {
+                        let bucket_value_offset_opt = {
+                            // ugly scope to drop the borrow on `self.arena`
+                            let (bucket_key, bucket_value_offset) = unsafe { self.arena.read_slice(addr) };
+                            if key == bucket_key {
+                                Some(bucket_value_offset)
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(bucket_value_offset) = bucket_value_offset_opt {
+                            let handler = unsafe { self.arena.get_handler::<V>(bucket_value_offset) };
+                            return Entry::Present(handler);
+                        } else {
+                            // full-hash collision.
+                        }
+                    }
+                    if self.dist(bucket_addr, in_place_hash_key) <= probing_distance {
+                        let kickable_entry = NotPresentEntryCases::KickableEntry(&mut self.arena, bucket_addr, &mut self.key_addr[..], PhantomData);
+                        return Entry::NotPresent(NotPresentEntry::new(kickable_entry));
+                    } else {
+                        // keep on probing...
+                    }
                 }
             }
         }
-        unimplemented!()
+        unreachable!();
     }
+
+    pub unsafe fn get(&self, key: &[u8]) -> Option<V> {
+        unimplemented!();
+//        let (_, val_addr_opt) = self.get_bucket_value_addr(key);
+//        val_addr_opt.map(|val_addr| self.heap.read::<V>(val_addr))
+    }
+
+    pub unsafe fn get_handler(&mut self, key: &[u8]) -> Option<Handler<V>> {
+        unimplemented!();
+//        let (_, val_addr_opt) = self.get_bucket_value_addr(key);
+//        val_addr_opt.map(move |val_addr| {
+//            self.heap.get_handler::<V>(val_addr)
+//        })
+    }
+}
+
+
+#[cfg(test)]
+mod test {
+
+//    #[test]
+//    fn test_read_key() {
+//        let key = "";
+//        read_key();
+//    }
+
 }
