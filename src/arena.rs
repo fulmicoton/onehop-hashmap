@@ -6,7 +6,7 @@ use std::ops::Deref;
 const NUM_BITS_PAGE_ADDR: usize = 20;
 const PAGE_SIZE: usize = 1 << NUM_BITS_PAGE_ADDR;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Addr(usize);
 
 impl Addr {
@@ -39,8 +39,12 @@ impl Page {
         }
     }
 
-    fn available(&self) -> usize {
-        PAGE_SIZE - self.len
+//    fn available(&self) -> usize {
+//        PAGE_SIZE - self.len
+//    }
+
+    fn len(&self) -> usize {
+        self.len
     }
 
     fn allocate(&mut self, len: usize) -> Option<Addr> {
@@ -53,9 +57,9 @@ impl Page {
         }
     }
 
-    fn get_slice(&self, addr: usize, len: usize) -> &[u8] {
-        &(*self.data)[addr..addr+len]
-    }
+//    fn get_slice(&self, addr: usize, len: usize) -> &[u8] {
+//        &(*self.data)[addr..addr+len]
+//    }
 
     unsafe fn read<V: Sized + Copy>(&self, addr: usize) -> V {
         ptr::read_unaligned(self.data.as_ptr().offset(addr as isize) as *const V)
@@ -73,7 +77,7 @@ impl Page {
         let data: &[u8] = &(*self.data)[addr..];
         let (len, read_len) = read_vint(data);
         let slice: &[u8] = &data[read_len..read_len+len];
-        (slice, Addr::new(self.page_id, read_len + len))
+        (slice, Addr::new(self.page_id, addr + read_len + len))
         // self.pages[addr.page_id()].read_slice(addr.page_local_addr())
     }
 }
@@ -84,7 +88,6 @@ pub struct Handler<'a, V: Copy> {
     val: V,
     addr: Addr,
 }
-
 
 impl<'a, T> Deref for Handler<'a, T> where T: Copy {
 
@@ -104,7 +107,9 @@ impl<'a, T> DerefMut for Handler<'a, T> where T: Copy {
 impl<'a, V> Drop for Handler<'a, V>
     where V: Copy {
     fn drop(&mut self) {
-        unsafe { self.arena.write(self.addr, self.val); }
+        unsafe {
+            self.arena.write(self.addr, self.val);
+        }
     }
 }
 
@@ -175,10 +180,6 @@ impl Arena {
         }
     }
 
-    fn last_page(&mut self) -> &mut Page {
-        self.pages.last_mut().unwrap()
-    }
-
     fn add_page(&mut self) -> &mut Page {
         let new_page_id = self.pages.len();
         self.pages.push(Page::new(new_page_id));
@@ -201,10 +202,9 @@ impl Arena {
         addr
     }
 
-    pub fn get_slice(&self, addr: Addr, len: usize) -> &[u8] {
-        self.pages[addr.page_id()]
-            .get_slice(addr.page_local_addr(), len)
-    }
+//    pub fn get_slice(&self, addr: Addr, len: usize) -> &[u8] {
+//        self.pages[addr.page_id()].get_slice(addr.page_local_addr(), len)
+//    }
 
     pub fn get_mut_slice(&mut self, addr: Addr, len: usize) -> &mut [u8] {
         self.pages[addr.page_id()]
@@ -213,6 +213,20 @@ impl Arena {
 
     pub unsafe fn get_handler<V: Copy>(&mut self, addr: Addr) -> Handler<V> {
         let val = self.read::<V>(addr);
+        Handler::new(self, val, addr)
+    }
+
+//    pub unsafe fn set_handler<V: Copy>(&mut self, addr: Addr, val: V) -> Handler<V> {
+//        Handler::new(self, val, addr)
+//    }
+
+    pub fn len(&self) -> usize {
+        self.pages.last().unwrap().len()
+    }
+
+    pub unsafe fn set_new_handler<V: Copy>(&mut self, val: V) -> Handler<V> {
+        let num_bytes = mem::size_of::<V>();
+        let addr = self.allocate(num_bytes);
         Handler::new(self, val, addr)
     }
 
