@@ -7,4 +7,4 @@ authors = ["Paul Masurel <paul.masurel@gmail.com>"]
 fnv = "1.0"
 
 [profile.release]
-lto = false
+lto = true

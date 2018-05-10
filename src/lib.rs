@@ -3,7 +3,7 @@
 mod murmurhash2;
 mod arena;
 
-const INITIAL_TABLE_SIZE: usize = 1_024 * 1_024 * 8;
+const INITIAL_TABLE_SIZE: usize = 1_024 * 1_024 * 4 * 2;
 
 use std::cmp;
 use std::mem;
@@ -107,7 +107,6 @@ pub struct HashMap<V> {
     key_addr: Vec<Bucket>,
     arena: Arena,
     data: PhantomData<V>,
-    max_probe_dist: usize,
     len: usize
 }
 
@@ -121,7 +120,6 @@ impl<V> HashMap<V>
             key_addr: vec![vacant_bucket; INITIAL_TABLE_SIZE],
             arena: Arena::new(),
             data: PhantomData,
-            max_probe_dist: 0, //< TODO fix me.
             len: 0
         }
     }
@@ -254,33 +252,69 @@ impl<V> HashMap<V>
         buckets[bucket_id] = occupied_bucket;
     }
 
-    fn insert_key_value<'a>(&'a mut self, bucket_addr: usize, hash: HashKey,  key: &[u8], value: V) -> Handler<'a, V> {
+    fn insert_key_value<'a>(&'a mut self, bucket_addr: usize, hash: HashKey,  key: &[u8], value: V) {
         let bytes_len: usize = key.len();
         let len_len: usize = vint_len(bytes_len);
         let payload_len: usize = len_len + bytes_len + mem::size_of::<V>();
         let (addr, data): (Addr, &mut [u8]) = self.arena.allocate_slice(payload_len);
         self.key_addr[bucket_addr] = Bucket::occupied(hash, addr);
         write_vint(&mut data[..len_len], bytes_len);
-        data[len_len..len_len + bytes_len].copy_from_slice(key);
-        Handler::new_with_value(&mut data[len_len + bytes_len..], value)
+        let value_offset = len_len + bytes_len;
+        data[len_len..value_offset].copy_from_slice(key);
+        unsafe {
+            let val_ptr = data.as_mut_ptr().offset(value_offset as isize) as *mut V;
+            ptr::write_unaligned(val_ptr, value);
+        }
     }
 
-//    pub fn update<'a, F: Fn(Option<V>)->V >(&'a mut self, key: &'a [u8], default_value: V, f: F) {}
+    pub fn update<'a, F: Fn(Option<V>)->V >(&'a mut self, key: &'a [u8], f: F) {
+        let hash = self.make_hash(key);
+        let mut probe = Probe::new(hash, self.key_addr.len());
+        for probing_distance in 0.. {
+            let bucket_addr = probe.advance();
+            let bucket = self.key_addr[bucket_addr];
+            if bucket.is_vacant()  {
+                self.len += 1;
+                let value = f(None);
+                self.insert_key_value(bucket_addr, hash, key, value);
+                return;
+            } else {
+                let in_place_hash = bucket.hash();
+                let in_place_addr = bucket.addr();
+                if in_place_hash == hash {
+                    // ugly scope to drop the borrow on `self.arena`
+                    let data: &mut [u8] = self.arena.get_large_slice_mut(in_place_addr);
+                    let (key_matches, value_offset) = {
+                        let (bucket_key, len) = extract_slice(data);
+                        (key == bucket_key, len)
+                    };
+                    if key_matches {
+                        unsafe {
+                            let val_ptr = data.as_mut_ptr().offset(value_offset as isize) as *mut V;
+                            let old_val = ptr::read_unaligned(val_ptr);
+                            let new_val = f(Some(old_val));
+                            ptr::write_unaligned(val_ptr, new_val);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        unreachable!()
+    }
 
+    /*
     pub fn get_or_insert<'a>(&'a mut self, key: &'a [u8], default_value: V) -> Handler<'a, V> {
         let hash = self.make_hash(key);
         let mut probe = Probe::new(hash, self.key_addr.len());
         for probing_distance in 0.. {
             let bucket_addr = probe.advance();
             let bucket = self.key_addr[bucket_addr];
-            {
-                if bucket.is_vacant()  {
-                    self.len += 1;
-                    self.max_probe_dist = cmp::max(self.max_probe_dist, probing_distance);
-                    return self.insert_key_value(bucket_addr, hash, key, default_value);
-                }
-            }
-            {
+            if bucket.is_vacant()  {
+                self.len += 1;
+                self.max_probe_dist = cmp::max(self.max_probe_dist, probing_distance);
+                return self.insert_key_value(bucket_addr, hash, key, default_value);
+            } else {
                 let in_place_hash = bucket.hash();
                 let in_place_addr = bucket.addr();
                 if in_place_hash == hash {
@@ -294,7 +328,9 @@ impl<V> HashMap<V>
                         let value_data = &mut data[value_offset..value_offset+mem::size_of::<V>()];
                         return Handler::new(value_data);
                     }
-                } else {
+                }
+                    /*
+                    else {
                     let in_place_probing_distance = probe.dist(bucket_addr, in_place_hash);
                     if in_place_probing_distance < probing_distance {
                         self.len += 1;
@@ -305,23 +341,21 @@ impl<V> HashMap<V>
                         // keep on probing...
                     }
                 }
+                */
             }
         }
         unreachable!()
     }
+    */
 
     pub fn len(&self) -> usize {
         self.len
     }
 
-    pub fn max_probe_dist(&self) -> usize {
-        self.max_probe_dist
-    }
-
     pub fn get(&self, key: &[u8]) -> Option<V> {
         let hash = self.make_hash(key);
         let mut probe = Probe::new(hash, self.key_addr.len());
-        for _ in 0..(self.max_probe_dist + 1) {
+        loop {
             let bucket_addr = probe.advance();
             let bucket = self.key_addr[bucket_addr];
             if bucket.is_vacant() {
