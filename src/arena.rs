@@ -70,6 +70,7 @@ impl Page {
         &mut (*self.data)[addr..addr+len]
     }
 
+    #[inline(always)]
     unsafe fn read_slice(&self, addr: usize) -> (&[u8], Addr) {
         let data: &[u8] = &(*self.data)[addr..];
         // fast track for small slices

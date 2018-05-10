@@ -44,30 +44,37 @@ impl<V> HashMap<V>
 }
 
 struct Probe {
-    dist: usize,
     bucket_addr: usize,
     mask: usize
 }
 
 impl Probe {
 
-    fn new(hash: HashKey, bucket_len: usize) -> Probe {
-        let mask = bucket_len - 1;
+
+    #[inline(always)]
+    fn new(hash: HashKey, len: usize) -> Probe {
+        let mask = len - 1;
         Probe {
-            dist: 0,
             bucket_addr: (hash as usize) & mask,
             mask
         }
     }
 
-    fn advance_by(&mut self, dist: usize) -> usize {
-        self.dist += dist;
-        self.bucket_addr = (self.bucket_addr + dist) & self.mask;
-        self.bucket_addr
+    fn new_with_dist(hash: HashKey, len: usize, dist: usize) -> Probe {
+        let mask = len - 1;
+        Probe {
+            bucket_addr: (hash as usize).wrapping_add(dist) & mask,
+            mask
+        }
     }
 
+    #[inline(always)]
+    fn dist(&self, bucket_id: usize, hash: HashKey) -> usize {
+        bucket_id.wrapping_sub(hash as usize) & self.mask
+    }
+
+    #[inline(always)]
     fn advance(&mut self) -> usize {
-        self.dist += 1;
         self.bucket_addr = (self.bucket_addr + 1) & self.mask;
         self.bucket_addr
     }
@@ -113,41 +120,27 @@ impl<'a, V:Copy + 'a> NotPresentEntry<'a, V>
         unsafe { self.hash_map.arena.set_new_handler(value) }
     }
 
+    #[inline(always)]
     fn kick(&mut self, probing_distance: usize, hash: HashKey, addr: Addr) {
         let mut occupied_bucket = Bucket::Occupied(hash, addr);
         let mut d = probing_distance;
-        let mut probe = Probe::new(self.hash, self.hash_map.key_addr.len());
-        let mut bucket_id = probe.advance_by(probing_distance);
+        let mut probe = Probe::new_with_dist(self.hash, self.hash_map.key_addr.len(), probing_distance);
         let buckets = &mut self.hash_map.key_addr[..];
-        loop {
-            match buckets[bucket_id] {
-                Bucket::Vacant => {
-                    buckets[bucket_id] = occupied_bucket;
-                    return;
-                },
-                Bucket::Occupied(in_place_hash, _) => {
-                    let in_place_probing_distance = dist(bucket_id, in_place_hash, buckets.len() - 1);
-                    if in_place_probing_distance < d {
-                        mem::swap(&mut occupied_bucket, &mut buckets[bucket_id]);
-                        d = in_place_probing_distance;
-                    }
-                }
+        let mut bucket_id = probe.advance();
+        while let Bucket::Occupied(in_place_hash, _) = unsafe { *buckets.get_unchecked(bucket_id) } {
+            let in_place_probing_distance = probe.dist(bucket_id, in_place_hash);
+            if in_place_probing_distance < d {
+                mem::swap(&mut occupied_bucket, &mut buckets[bucket_id]);
+                d = in_place_probing_distance;
             }
             bucket_id = probe.advance();
             d += 1;
         }
+        buckets[bucket_id] = occupied_bucket;
     }
 }
 
 
-fn dist(bucket_id: usize, hash: HashKey, mask: usize) -> usize {
-    let target_pos: usize = (hash as usize) & mask;
-    if bucket_id >= target_pos {
-        bucket_id - target_pos
-    } else {
-        mask + 1 + bucket_id - target_pos
-    }
-}
 
 
 enum NotPresentEntryCases {
@@ -172,6 +165,7 @@ impl<'a, V:'a> Entry<'a, V> where V: Copy {
     }
 }
 
+
 impl<V> HashMap<V>
     where V: Copy {
 
@@ -187,9 +181,74 @@ impl<V> HashMap<V>
         murmurhash2::murmurhash2(key)
     }
 
+
+    fn kick(&mut self, mut probing_distance: usize, hash: HashKey, addr: Addr) {
+        let mut occupied_bucket = Bucket::Occupied(hash, addr);
+        let buckets = &mut self.key_addr[..];
+        let mut probe = Probe::new_with_dist(hash, buckets.len(), probing_distance);
+        let mut bucket_id = probe.advance();
+        while let Bucket::Occupied(in_place_hash, _) = buckets[bucket_id] {
+            let in_place_probing_distance = probe.dist(bucket_id, in_place_hash);
+            if in_place_probing_distance < probing_distance {
+                mem::swap(&mut occupied_bucket, &mut buckets[bucket_id]);
+                probing_distance = in_place_probing_distance;
+            }
+            probing_distance += 1;
+            bucket_id = probe.advance();
+
+        }
+        buckets[bucket_id] = occupied_bucket;
+    }
+
+    pub fn get_or_insert<'a>(&'a mut self, key: &'a [u8], default_value: V) -> Handler<'a, V> {
+        let mut hash = self.make_hash(key);
+        let mut probe = Probe::new(hash, self.key_addr.len());
+        for probing_distance in 0.. {
+            let bucket_addr = probe.advance();
+            match self.key_addr[bucket_addr] {
+                Bucket::Vacant => {
+                    self.len += 1;
+                    let addr = self.arena.save_slice(key);
+                    self.max_probe_dist = cmp::max(self.max_probe_dist, probing_distance);
+                    self.key_addr[bucket_addr] = Bucket::Occupied(hash, addr);
+                    return unsafe { self.arena.set_new_handler(default_value) };
+                }
+                Bucket::Occupied(in_place_hash, in_place_addr) => {
+                    if in_place_hash == hash {
+                        // ugly scope to drop the borrow on `self.arena`
+                        unsafe {
+                            let (key_matches, bucket_value_offset) = {
+                                let (bucket_key, bucket_value_offset_val) = self.arena.read_slice(in_place_addr);
+                                (key == bucket_key, bucket_value_offset_val)
+                            };
+                            if key_matches {
+                                return self.arena.get_handler::<V>(bucket_value_offset);
+                            }
+                        }
+                    } else {
+                        let in_place_probing_distance = probe.dist(bucket_addr, in_place_hash);
+                        if in_place_probing_distance < probing_distance {
+                            self.len += 1;
+                            let addr = self.arena.save_slice(key);
+                            self.max_probe_dist = cmp::max(self.max_probe_dist, probing_distance);
+                            self.key_addr[bucket_addr] = Bucket::Occupied(hash, addr);
+                            self.kick(in_place_probing_distance + 1, in_place_hash, in_place_addr);
+                            return unsafe { self.arena.set_new_handler(default_value) };
+                        } else {
+                            // keep on probing...
+                        }
+                    }
+                }
+            }
+        }
+        unreachable!()
+    }
+
+
     pub fn entry<'a>(&'a mut self, key: &'a [u8]) -> Entry<'a, V> {
         let hash = self.make_hash(key);
         let mut probe = Probe::new(hash, self.key_addr.len());
+
         for probing_distance in 0.. {
             let bucket_addr = probe.advance();
             match self.key_addr[bucket_addr] {
@@ -204,41 +263,38 @@ impl<V> HashMap<V>
                 }
                 Bucket::Occupied(in_place_hash, addr) => {
                     if in_place_hash == hash {
-                        let bucket_value_offset_opt = {
-                            // ugly scope to drop the borrow on `self.arena`
-                            let (bucket_key, bucket_value_offset) = unsafe { self.arena.read_slice(addr) };
-                            if key == bucket_key {
-                                Some(bucket_value_offset)
-                            } else {
-                                None
+                        // ugly scope to drop the borrow on `self.arena`
+                        unsafe {
+                            let (key_matches, bucket_value_offset) = {
+                                let (bucket_key, bucket_value_offset_val) = self.arena.read_slice(addr);
+                                (key == bucket_key, bucket_value_offset_val)
+                            };
+                            if key_matches {
+                                let handler = self.arena.get_handler::<V>(bucket_value_offset);
+                                return Entry::Present(handler);
                             }
-                        };
-                        if let Some(bucket_value_offset) = bucket_value_offset_opt {
-                            let handler = unsafe { self.arena.get_handler::<V>(bucket_value_offset) };
-                            return Entry::Present(handler);
-                        } else {
-                            // full-hash collision.
                         }
-                    }
-                    let in_place_probing_distance = dist(bucket_addr, in_place_hash, self.key_addr.len() - 1);
-                    if in_place_probing_distance <= probing_distance {
-                        // the entry at the bucket is at a lower distance.
-                        // We can kick it and takes its place.
-                        let kickable_entry = NotPresentEntryCases::KickableEntry {
-                            probing_distance: in_place_probing_distance,
-                            hash: in_place_hash,
-                            addr
-                        };
-                        let e = NotPresentEntry::new(
-                            self,
-                            probing_distance,
-                            bucket_addr,
-                            hash,
-                            key,
-                            kickable_entry);
-                        return Entry::NotPresent(e);
                     } else {
-                        // keep on probing...
+                        let in_place_probing_distance = probe.dist(bucket_addr, in_place_hash);
+                        if in_place_probing_distance < probing_distance {
+                            // the entry at the bucket is at a lower distance.
+                            // We can kick it and takes its place.
+                            let kickable_entry = NotPresentEntryCases::KickableEntry {
+                                probing_distance: in_place_probing_distance,
+                                hash: in_place_hash,
+                                addr
+                            };
+                            let e = NotPresentEntry::new(
+                                self,
+                                probing_distance,
+                                bucket_addr,
+                                hash,
+                                key,
+                                kickable_entry);
+                            return Entry::NotPresent(e);
+                        } else {
+                            // keep on probing...
+                        }
                     }
                 }
             }
@@ -266,10 +322,12 @@ impl<V> HashMap<V>
                 Bucket::Occupied(in_place_hash_key, addr) => {
                     if in_place_hash_key == hash {
                         // ugly scope to drop the borrow on `self.arena`
-                        let (bucket_key, bucket_value_offset) = unsafe { self.arena.read_slice(addr) };
-                        if key == bucket_key {
-                            let value: V = unsafe { self.arena.read(bucket_value_offset) };
-                            return Some(value);
+                        unsafe {
+                            let (bucket_key, bucket_value_offset) = self.arena.read_slice(addr);
+                            if key == bucket_key {
+                                let value: V = self.arena.read(bucket_value_offset);
+                                return Some(value);
+                            }
                         }
                     }
                 }
