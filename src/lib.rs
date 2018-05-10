@@ -1,3 +1,5 @@
+#![feature(nll)]
+
 mod murmurhash2;
 mod arena;
 
@@ -5,13 +7,55 @@ const INITIAL_TABLE_SIZE: usize = 1_024 * 1_024 * 8;
 
 use std::cmp;
 use std::mem;
-use std::hash::{Hasher, BuildHasher};
-use std::collections::hash_map::RandomState;
 use std::marker::PhantomData;
-use arena::{Addr, Handler, Arena};
+pub use arena::{Addr, Arena};
+use std::ptr;
+use std::ops::{Deref, DerefMut};
 
 
 pub type HashKey = u32;
+
+/// Returns the number in bytes that will
+/// be required to serialisze `n` as a variable int.
+fn vint_len(n: usize) -> usize {
+    if n < 128 {
+        1
+    } else {
+        let num_bits_required: usize = 64 - n.leading_zeros() as usize;
+        num_bits_required.wrapping_add(6) / 7
+    }
+}
+
+
+const CONTINUE_FLAG: u8 = 1u8 << 7;
+const SEVEN_BIT_MASK: usize = (CONTINUE_FLAG - 1u8) as usize;
+
+fn write_vint(buffer: &mut [u8], mut val: usize) {
+    for dest_byte in buffer.iter_mut() {
+        let b = (val & SEVEN_BIT_MASK) as u8;
+        val >>= 7;
+        if val == 0 {
+            *dest_byte = b;
+            break;
+        } else {
+            *dest_byte = b | CONTINUE_FLAG;
+        }
+    }
+}
+
+fn read_vint(buffer: &[u8]) -> (usize, usize) {
+    let mut n = 0;
+    let mut bit_shift = 0;
+    for (num_consumed_bytes, b) in buffer.iter().cloned().enumerate() {
+        n |= ((b as usize) & SEVEN_BIT_MASK) << bit_shift;
+        if b & CONTINUE_FLAG == 0u8 {
+            return (n, num_consumed_bytes + 1);
+        } else {
+            bit_shift += 7;
+        }
+    }
+    (n, buffer.len())
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Bucket {
@@ -90,8 +134,6 @@ struct Probe {
 }
 
 impl Probe {
-
-
     #[inline(always)]
     fn new(hash: HashKey, len: usize) -> Probe {
         let mask = len - 1;
@@ -121,95 +163,59 @@ impl Probe {
     }
 }
 
-/*
-pub struct NotPresentEntry<'a, V: Copy + 'a> {
-    hash_map: &'a mut HashMap<V>,
-    probing_distance: usize,
-    bucket_id: usize,
-    inner: NotPresentEntryCases,
-    key: &'a [u8],
-    hash: HashKey,
-    _type: PhantomData<V>
+
+pub struct Handler<'a, V: Copy> {
+    dest: &'a mut [u8],
+    val: V
 }
 
+impl<'a, T> Deref for Handler<'a, T> where T: Copy {
 
+    type Target = T;
 
-impl<'a, V:Copy + 'a> NotPresentEntry<'a, V>
-{
-    fn new(hash_map: &'a mut HashMap<V>,
-           probing_distance: usize,
-           bucket_id: usize,
-           hash: HashKey,
-           key: &'a [u8],
-           cases: NotPresentEntryCases) -> Self {
-        NotPresentEntry {
-            hash_map,
-            probing_distance,
-            bucket_id,
-            inner: cases,
-            key,
-            hash,
-            _type: PhantomData
-        }
-    }
-
-    fn insert(mut self, value: V)  -> Handler<'a, V> {
-        self.hash_map.len += 1;
-        let addr = self.hash_map.arena.save_slice(self.key);
-        self.hash_map.max_probe_dist = cmp::max(self.hash_map.max_probe_dist, self.probing_distance);
-        self.hash_map.key_addr[self.bucket_id] = bucket::occupied(self.hash, addr);
-        if let NotPresentEntryCases::KickableEntry { probing_distance, hash, addr } = self.inner {
-            self.kick(probing_distance + 1, hash, addr);
-        }
-        unsafe { self.hash_map.arena.set_new_handler(value) }
-    }
-
-    #[inline(always)]
-    fn kick(&mut self, probing_distance: usize, hash: HashKey, addr: Addr) {
-        let mut occupied_bucket = bucket::occupied(hash, addr);
-        let mut d = probing_distance;
-        let mut probe = Probe::new_with_dist(self.hash, self.hash_map.key_addr.len(), probing_distance);
-        let buckets = &mut self.hash_map.key_addr[..];
-        let mut bucket_id = probe.advance();
-        loop {
-            let bucket = unsafe { *buckets.get_unchecked(bucket_id) };
-            if bucket.is_vacant() {
-                break;
-            }
-            let in_place_probing_distance = probe.dist(bucket_id, bucket.hash());
-            if in_place_probing_distance < d {
-                mem::swap(&mut occupied_bucket, &mut buckets[bucket_id]);
-                d = in_place_probing_distance;
-            }
-            bucket_id = probe.advance();
-            d += 1;
-        }
-        buckets[bucket_id] = occupied_bucket;
+    fn deref(&self) -> &T {
+        &self.val
     }
 }
 
-enum NotPresentEntryCases {
-    VacantEntry,
-    KickableEntry { probing_distance: usize, hash: HashKey, addr: Addr }
+impl<'a, T> DerefMut for Handler<'a, T> where T: Copy {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.val
+    }
 }
 
-pub enum Entry<'a, V:'a> where V: Copy {
-    NotPresent(NotPresentEntry<'a, V>),
-    Present(Handler<'a, V>)
-}
-
-impl<'a, V:'a> Entry<'a, V> where V: Copy {
-    #[inline(always)]
-    pub fn or_insert(self, default_value: V) -> Handler<'a, V> {
-        match self {
-            Entry::Present(handler) => handler,
-            Entry::NotPresent(entry) => {
-                entry.insert(default_value)
-            }
+impl<'a, V> Drop for Handler<'a, V>
+    where V: Copy {
+    fn drop(&mut self) {
+        unsafe {
+            ptr::write_unaligned(self.dest.as_mut_ptr() as *mut V, self.val)
         }
     }
 }
-*/
+
+impl<'a, V: Copy> Handler<'a, V> {
+    fn new(dest: &'a mut[u8]) -> Handler<'a, V> {
+        let val = unsafe { ptr::read(dest.as_ptr() as *const V) };
+        Handler::new_with_value(dest, val)
+    }
+
+    fn new_with_value(dest: &'a mut[u8], val: V) -> Handler<'a, V> {
+        Handler {
+            dest,
+            val
+        }
+    }
+}
+
+fn extract_slice(data: &[u8]) -> (&[u8], usize) {
+    let len = data[0] as usize;
+    if len < 128 {
+        (&data[1..1 + len], 1 + len)
+    } else {
+        let (len, read_len) = read_vint(data);
+        (&data[read_len..read_len+len], read_len + len)
+    }
+}
 
 impl<V> HashMap<V>
     where V: Copy {
@@ -225,7 +231,6 @@ impl<V> HashMap<V>
     fn make_hash(&self, key: &[u8]) -> HashKey {
         murmurhash2::murmurhash2(key)
     }
-
 
     fn kick(&mut self, mut probing_distance: usize, hash: HashKey, addr: Addr) {
         let mut occupied_bucket = Bucket::occupied(hash, addr);
@@ -249,41 +254,53 @@ impl<V> HashMap<V>
         buckets[bucket_id] = occupied_bucket;
     }
 
+    fn insert_key_value<'a>(&'a mut self, bucket_addr: usize, hash: HashKey,  key: &[u8], value: V) -> Handler<'a, V> {
+        let bytes_len: usize = key.len();
+        let len_len: usize = vint_len(bytes_len);
+        let payload_len: usize = len_len + bytes_len + mem::size_of::<V>();
+        let (addr, data): (Addr, &mut [u8]) = self.arena.allocate_slice(payload_len);
+        self.key_addr[bucket_addr] = Bucket::occupied(hash, addr);
+        write_vint(&mut data[..len_len], bytes_len);
+        data[len_len..len_len + bytes_len].copy_from_slice(key);
+        Handler::new_with_value(&mut data[len_len + bytes_len..], value)
+    }
+
+//    pub fn update<'a, F: Fn(Option<V>)->V >(&'a mut self, key: &'a [u8], default_value: V, f: F) {}
+
     pub fn get_or_insert<'a>(&'a mut self, key: &'a [u8], default_value: V) -> Handler<'a, V> {
-        let mut hash = self.make_hash(key);
+        let hash = self.make_hash(key);
         let mut probe = Probe::new(hash, self.key_addr.len());
         for probing_distance in 0.. {
             let bucket_addr = probe.advance();
             let bucket = self.key_addr[bucket_addr];
-            if bucket.is_vacant()  {
-                self.len += 1;
-                let addr = self.arena.save_slice(key);
-                self.max_probe_dist = cmp::max(self.max_probe_dist, probing_distance);
-                self.key_addr[bucket_addr] = Bucket::occupied(hash, addr);
-                return unsafe { self.arena.set_new_handler(default_value) };
-            } else {
+            {
+                if bucket.is_vacant()  {
+                    self.len += 1;
+                    self.max_probe_dist = cmp::max(self.max_probe_dist, probing_distance);
+                    return self.insert_key_value(bucket_addr, hash, key, default_value);
+                }
+            }
+            {
                 let in_place_hash = bucket.hash();
                 let in_place_addr = bucket.addr();
                 if in_place_hash == hash {
                     // ugly scope to drop the borrow on `self.arena`
-                    unsafe {
-                        let (key_matches, bucket_value_offset) = {
-                            let (bucket_key, bucket_value_offset_val) = self.arena.read_slice(in_place_addr);
-                            (key == bucket_key, bucket_value_offset_val)
-                        };
-                        if key_matches {
-                            return self.arena.get_handler::<V>(bucket_value_offset);
-                        }
+                    let data: &mut [u8] = self.arena.get_large_slice_mut(in_place_addr);
+                    let (key_matches, value_offset) = {
+                        let (bucket_key, len) = extract_slice(data);
+                        (key == bucket_key, len)
+                    };
+                    if key_matches {
+                        let value_data = &mut data[value_offset..value_offset+mem::size_of::<V>()];
+                        return Handler::new(value_data);
                     }
                 } else {
                     let in_place_probing_distance = probe.dist(bucket_addr, in_place_hash);
                     if in_place_probing_distance < probing_distance {
                         self.len += 1;
-                        let addr = self.arena.save_slice(key);
                         self.max_probe_dist = cmp::max(self.max_probe_dist, probing_distance);
-                        self.key_addr[bucket_addr] = Bucket::occupied(hash, addr);
                         self.kick(in_place_probing_distance + 1, in_place_hash, in_place_addr);
-                        return unsafe { self.arena.set_new_handler(default_value) };
+                        return self.insert_key_value(bucket_addr, hash, key, default_value);
                     } else {
                         // keep on probing...
                     }
@@ -292,66 +309,6 @@ impl<V> HashMap<V>
         }
         unreachable!()
     }
-
-
-    /*
-    pub fn entry<'a>(&'a mut self, key: &'a [u8]) -> Entry<'a, V> {
-        let hash = self.make_hash(key);
-        let mut probe = Probe::new(hash, self.key_addr.len());
-
-        for probing_distance in 0.. {
-            let bucket_addr = probe.advance();
-            match self.key_addr[bucket_addr] {
-                Bucket::Vacant => {
-                    let vacant_entry = NotPresentEntryCases::VacantEntry;
-                    return Entry::NotPresent(NotPresentEntry::new(self,
-                                                                  probing_distance,
-                                                                  bucket_addr,
-                                                                  hash,
-                                                                  key,
-                                                                  vacant_entry));
-                }
-                Bucket::Occupied(in_place_hash, addr) => {
-                    if in_place_hash == hash {
-                        // ugly scope to drop the borrow on `self.arena`
-                        unsafe {
-                            let (key_matches, bucket_value_offset) = {
-                                let (bucket_key, bucket_value_offset_val) = self.arena.read_slice(addr);
-                                (key == bucket_key, bucket_value_offset_val)
-                            };
-                            if key_matches {
-                                let handler = self.arena.get_handler::<V>(bucket_value_offset);
-                                return Entry::Present(handler);
-                            }
-                        }
-                    } else {
-                        let in_place_probing_distance = probe.dist(bucket_addr, in_place_hash);
-                        if in_place_probing_distance < probing_distance {
-                            // the entry at the bucket is at a lower distance.
-                            // We can kick it and takes its place.
-                            let kickable_entry = NotPresentEntryCases::KickableEntry {
-                                probing_distance: in_place_probing_distance,
-                                hash: in_place_hash,
-                                addr
-                            };
-                            let e = NotPresentEntry::new(
-                                self,
-                                probing_distance,
-                                bucket_addr,
-                                hash,
-                                key,
-                                kickable_entry);
-                            return Entry::NotPresent(e);
-                        } else {
-                            // keep on probing...
-                        }
-                    }
-                }
-            }
-        }
-        unreachable!();
-    }
-    */
 
     pub fn len(&self) -> usize {
         self.len
@@ -375,10 +332,14 @@ impl<V> HashMap<V>
                 if in_place_hash_key == hash {
                     // ugly scope to drop the borrow on `self.arena`
                     unsafe {
-                        let (bucket_key, bucket_value_offset) = self.arena.read_slice(addr);
-                        if key == bucket_key {
-                            let value: V = self.arena.read(bucket_value_offset);
-                            return Some(value);
+                        let data = self.arena.get_large_slice(addr);
+                        let (key_matches, value_offset) = {
+                            let (bucket_key, len) = extract_slice(data);
+                            (key == bucket_key, len)
+                        };
+                        if key_matches {
+                            let value_ptr = data.as_ptr().offset(value_offset as isize) as *const V;
+                            return Some(ptr::read_unaligned(value_ptr));
                         }
                     }
                 }
@@ -392,16 +353,17 @@ impl<V> HashMap<V>
 
 #[cfg(test)]
 mod test {
-
     use super::HashMap;
-    use std::collections::hash_map::RandomState;
+    use super::vint_len;
+    use super::write_vint;
+    use super::read_vint;
 
     #[test]
     fn test_insert_one() {
         let mut hash_map: HashMap<u32> = HashMap::new();
         assert_eq!(hash_map.get(b"coucou"), None);
         {
-            let mut handler = hash_map.entry(b"coucou").or_insert(0);
+            let mut handler = hash_map.get_or_insert(b"coucou", 0);
             *handler += 1;
         }
         assert_eq!(hash_map.len(), 1);
@@ -414,12 +376,12 @@ mod test {
         let mut hash_map: HashMap<u32> = HashMap::new();
         assert_eq!(hash_map.get(b"coucou"), None);
         {
-            let mut handler = hash_map.entry(b"coucou").or_insert(0);
+            let mut handler = hash_map.get_or_insert(b"coucou", 0);
             *handler += 1;
         }
         assert_eq!(hash_map.len(), 1);
         {
-            let mut handler = hash_map.entry(b"coucou").or_insert(0);
+            let mut handler = hash_map.get_or_insert(b"coucou", 0);
             *handler += 1;
         }
         assert_eq!(hash_map.len(), 1);
@@ -431,11 +393,11 @@ mod test {
         let mut hash_map: HashMap<u32> = HashMap::new();
         assert_eq!(hash_map.get(b"coucou"), None);
         {
-            let mut handler = hash_map.entry(b"coucou").or_insert(0);
+            let mut handler = hash_map.get_or_insert(b"coucou", 0);
             *handler += 1;
         }
         {
-            let mut handler = hash_map.entry(b"coucou").or_insert(0);
+            let mut handler = hash_map.get_or_insert(b"coucou", 0);
             *handler += 1;
         }
         assert_eq!(hash_map.get(b"coucou"), Some(2));
@@ -446,20 +408,20 @@ mod test {
         let mut hash_map: HashMap<u32> = HashMap::new();
         assert_eq!(hash_map.get(b"coucou"), None);
         {
-            let mut handler = hash_map.entry(b"coucou").or_insert(0);
+            let mut handler = hash_map.get_or_insert(b"coucou", 0);
             *handler += 1;
         }
         assert_eq!(hash_map.get(b"coucou2"), None);
         {
-            let mut handler = hash_map.entry(b"coucou2").or_insert(0);
+            let mut handler = hash_map.get_or_insert(b"coucou2", 0);
             *handler += 1;
         }
         {
-            let mut handler = hash_map.entry(b"coucou3").or_insert(0);
+            let mut handler = hash_map.get_or_insert(b"coucou3", 0);
             *handler += 1;
         }
         {
-            let mut handler = hash_map.entry(b"coucou4").or_insert(0);
+            let mut handler = hash_map.get_or_insert(b"coucou4", 0);
             *handler += 1;
         }
         assert_eq!(hash_map.get(b"coucou"), Some(1));
@@ -475,7 +437,7 @@ mod test {
             let key_bytes = key.as_bytes();
             assert_eq!(hash_map.get(key_bytes), None);
             {
-                let mut handler = hash_map.entry(key_bytes).or_insert(0);
+                let mut handler = hash_map.get_or_insert(key_bytes, 0);
                 *handler += 1;
             }
         }
@@ -484,7 +446,7 @@ mod test {
             let key_bytes = key.as_bytes();
             assert_eq!(hash_map.get(key_bytes), Some(1));
             {
-                let mut handler = hash_map.entry(key_bytes).or_insert(0);
+                let mut handler = hash_map.get_or_insert(key_bytes, 0);
                 *handler += 1;
             }
         }
@@ -493,6 +455,24 @@ mod test {
             let key_bytes = key.as_bytes();
             assert_eq!(hash_map.get(key_bytes), Some(2));
         }
+    }
+
+
+    #[test]
+    fn test_vint() {
+        let test_aux = |n: usize| {
+            let mut dest = [0u8; 10];
+            let len_num_bytes = vint_len(n);
+            write_vint(&mut dest[..len_num_bytes], n);
+            let (n_read, num_bytes) = read_vint(&dest);
+            assert_eq!(n_read, n);
+            assert_eq!(num_bytes, len_num_bytes);
+        };
+        test_aux(0);
+        test_aux(1);
+        test_aux(127);
+        test_aux(256);
+        test_aux(1_000_000);
     }
 
 }
