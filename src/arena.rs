@@ -10,14 +10,17 @@ const PAGE_SIZE: usize = 1 << NUM_BITS_PAGE_ADDR;
 pub struct Addr(usize);
 
 impl Addr {
+    #[inline(always)]
     fn new(page_id: usize, local_addr: usize) -> Addr {
         Addr(page_id << NUM_BITS_PAGE_ADDR | local_addr)
     }
 
+    #[inline(always)]
     fn page_id(&self) -> usize {
         self.0 >> NUM_BITS_PAGE_ADDR
     }
 
+    #[inline(always)]
     fn page_local_addr(&self) -> usize {
         self.0 & (PAGE_SIZE - 1)
     }
@@ -39,14 +42,12 @@ impl Page {
         }
     }
 
-//    fn available(&self) -> usize {
-//        PAGE_SIZE - self.len
-//    }
-
+    #[inline(always)]
     fn len(&self) -> usize {
         self.len
     }
 
+    #[inline(always)]
     fn allocate(&mut self, len: usize) -> Option<Addr> {
         if len + self.len <= PAGE_SIZE {
             let local_addr = self.len;
@@ -56,10 +57,6 @@ impl Page {
             None
         }
     }
-
-//    fn get_slice(&self, addr: usize, len: usize) -> &[u8] {
-//        &(*self.data)[addr..addr+len]
-//    }
 
     unsafe fn read<V: Sized + Copy>(&self, addr: usize) -> V {
         ptr::read_unaligned(self.data.as_ptr().offset(addr as isize) as *const V)
@@ -75,10 +72,16 @@ impl Page {
 
     unsafe fn read_slice(&self, addr: usize) -> (&[u8], Addr) {
         let data: &[u8] = &(*self.data)[addr..];
-        let (len, read_len) = read_vint(data);
-        let slice: &[u8] = &data[read_len..read_len+len];
-        (slice, Addr::new(self.page_id, addr + read_len + len))
-        // self.pages[addr.page_id()].read_slice(addr.page_local_addr())
+        // fast track for small slices
+        let len = data[0] as usize;
+        if len < 128 {
+            (&data[1..1 + len], Addr::new(self.page_id, addr + 1 + len))
+        } else {
+            let (len, read_len) = read_vint(data);
+            let slice: &[u8] = &data[read_len..read_len+len];
+            (slice, Addr::new(self.page_id, addr + read_len + len))
+        }
+
     }
 }
 
@@ -157,7 +160,7 @@ fn write_vint(buffer: &mut [u8], mut val: usize) {
 }
 
 
-fn read_vint(buffer: &[u8]) -> (usize, usize) {
+    fn read_vint(buffer: &[u8]) -> (usize, usize) {
     let mut n = 0;
     let mut bit_shift = 0;
     for (num_consumed_bytes, b) in buffer.iter().cloned().enumerate() {
