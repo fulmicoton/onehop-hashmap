@@ -7,7 +7,7 @@ const NUM_BITS_PAGE_ADDR: usize = 20;
 const PAGE_SIZE: usize = 1 << NUM_BITS_PAGE_ADDR;
 
 #[derive(Clone, Copy, Debug)]
-pub struct Addr(usize);
+pub struct Addr(pub usize);
 
 impl Addr {
     #[inline(always)]
