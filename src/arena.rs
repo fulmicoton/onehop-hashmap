@@ -2,25 +2,25 @@ use std::ptr;
 use std::mem;
 
 const NUM_BITS_PAGE_ADDR: usize = 20;
-const PAGE_SIZE: usize = 1 << NUM_BITS_PAGE_ADDR;
+const PAGE_SIZE: usize = 1 << NUM_BITS_PAGE_ADDR; // pages are 1 MB large
 
 #[derive(Clone, Copy, Debug)]
-pub struct Addr(pub usize);
+pub struct Addr(pub u32);
 
 impl Addr {
     #[inline(always)]
     fn new(page_id: usize, local_addr: usize) -> Addr {
-        Addr(page_id << NUM_BITS_PAGE_ADDR | local_addr)
+        Addr( (page_id << NUM_BITS_PAGE_ADDR | local_addr) as u32)
     }
 
     #[inline(always)]
     fn page_id(&self) -> usize {
-        self.0 >> NUM_BITS_PAGE_ADDR
+        (self.0 as usize) >> NUM_BITS_PAGE_ADDR
     }
 
     #[inline(always)]
     fn page_local_addr(&self) -> usize {
-        self.0 & (PAGE_SIZE - 1)
+        (self.0 as usize) & (PAGE_SIZE - 1)
     }
 
 }
@@ -40,9 +40,15 @@ impl Page {
         }
     }
 
+
     #[inline(always)]
-    fn allocate_slice(&mut self, len: usize) -> Option<(Addr, &mut [u8])> {
-        if len + self.len <= PAGE_SIZE {
+    fn is_available(&self, len: usize) -> bool {
+        len + self.len <= PAGE_SIZE
+    }
+
+    #[inline(always)]
+    fn allocate(&mut self, len: usize) -> Option<(Addr, &mut [u8])> {
+        if self.is_available(len) {
             let local_addr = self.len;
             self.len += len;
             let addr = Addr::new(self.page_id, local_addr);
@@ -56,12 +62,14 @@ impl Page {
         &mut (*self.data)[addr..addr+len]
     }
 
-    pub(crate) fn get_large_slice(&self, addr: usize) -> &[u8] {
-        &(*self.data)[addr..]
+    #[inline(always)]
+    pub(crate) unsafe fn get_ptr(&self, addr: usize) -> *const u8 {
+        self.data.as_ptr().offset(addr as isize)
     }
 
-    pub(crate) fn get_large_slice_mut(&mut self, addr: usize) -> &mut [u8] {
-        &mut (*self.data)[addr..]
+    #[inline(always)]
+    pub(crate) unsafe fn get_mut_ptr(&mut self, addr: usize) -> *mut u8 {
+        self.data.as_mut_ptr().offset(addr as isize)
     }
 }
 
@@ -70,11 +78,13 @@ pub struct Arena {
     pages: Vec<Page>,
 }
 
+
 impl Arena {
+
     pub fn new() -> Arena {
         let mut first_page = Page::new(0);
         // reserving addr=0
-        first_page.allocate_slice(1);
+        first_page.allocate(1);
         Arena {
             pages: vec![first_page]
         }
@@ -87,33 +97,34 @@ impl Arena {
     }
 
     pub fn save<V: Sized + Copy>(&mut self, val: V) -> Addr {
-        let (addr, slice) = self.allocate_slice(mem::size_of::<V>());
+        let (addr, slice) = self.allocate(mem::size_of::<V>());
         unsafe {
             ptr::write_unaligned(slice.as_mut_ptr() as *mut V, val)
         }
         addr
     }
 
+    #[inline(always)]
     pub fn get_mut_slice(&mut self, addr: Addr, len: usize) -> &mut [u8] {
         self.pages[addr.page_id()]
             .get_mut_slice(addr.page_local_addr(), len)
     }
 
-    pub fn get_large_slice(&self, addr: Addr) -> &[u8] {
-        self.pages[addr.page_id()].get_large_slice(addr.page_local_addr())
+    pub unsafe fn get_ptr(&self, addr: Addr) -> *const u8 {
+        self.pages[addr.page_id()].get_ptr(addr.page_local_addr())
     }
 
-    pub fn get_large_slice_mut(&mut self, addr: Addr) -> &mut [u8] {
-        self.pages[addr.page_id()].get_large_slice_mut(addr.page_local_addr())
+    pub unsafe fn get_mut_ptr(&mut self, addr: Addr) -> *mut u8 {
+        self.pages[addr.page_id()].get_mut_ptr(addr.page_local_addr())
     }
 
-    pub fn allocate_slice(&mut self, len: usize) -> (Addr, &mut [u8]) {
+    pub fn allocate(&mut self, len: usize) -> (Addr, &mut [u8]) {
         assert!(len < PAGE_SIZE, "Can't allocate anything over {}", PAGE_SIZE);
         let page_id = self.pages.len() - 1;
-        if let Some(res) = self.pages[page_id].allocate_slice(len) {
-            res
+        if self.pages[page_id].is_available(len) {
+            return self.pages[page_id].allocate(len).unwrap();
         } else {
-            self.add_page().allocate_slice(len).unwrap()
+            return self.add_page().allocate(len).unwrap();
         }
     }
 
@@ -131,12 +142,12 @@ mod tests {
         let b = b"happy tax payer";
 
         let addr_a = {
-            let (addr_a, data) = arena.allocate_slice(a.len());
+            let (addr_a, data) = arena.allocate(a.len());
             data.copy_from_slice(a);
             addr_a
         };
         let addr_b = {
-            let (addr_b, data) = arena.allocate_slice(b.len());
+            let (addr_b, data) = arena.allocate(b.len());
             data.copy_from_slice(b);
             addr_b
         };

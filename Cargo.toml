@@ -3,8 +3,5 @@ name = "onehop-hashmap"
 version = "0.1.0"
 authors = ["Paul Masurel <paul.masurel@gmail.com>"]
 
-[dependencies]
-fnv = "1.0"
-
 [profile.release]
 lto = true
