@@ -1,6 +1,3 @@
-use std::ptr;
-use std::mem;
-
 const NUM_BITS_PAGE_ADDR: usize = 20;
 const PAGE_SIZE: usize = 1 << NUM_BITS_PAGE_ADDR; // pages are 1 MB large
 
@@ -33,13 +30,14 @@ struct Page {
 
 impl Page {
     fn new(page_id: usize) -> Page {
+        let mut data: Vec<u8> = Vec::with_capacity(PAGE_SIZE);
+        unsafe { data.set_len(PAGE_SIZE); }
         Page {
             page_id,
             len: 0,
-            data: vec![0u8; PAGE_SIZE].into_boxed_slice()
+            data: data.into_boxed_slice()
         }
     }
-
 
     #[inline(always)]
     fn is_available(&self, len: usize) -> bool {
@@ -58,10 +56,6 @@ impl Page {
         }
     }
 
-    fn get_mut_slice(&mut self, addr: usize, len: usize) -> &mut [u8] {
-        &mut (*self.data)[addr..addr+len]
-    }
-
     #[inline(always)]
     pub(crate) unsafe fn get_ptr(&self, addr: usize) -> *const u8 {
         self.data.as_ptr().offset(addr as isize)
@@ -78,7 +72,6 @@ pub struct Arena {
     pages: Vec<Page>,
 }
 
-
 impl Arena {
 
     pub fn new() -> Arena {
@@ -94,20 +87,6 @@ impl Arena {
         let new_page_id = self.pages.len();
         self.pages.push(Page::new(new_page_id));
         &mut self.pages[new_page_id]
-    }
-
-    pub fn save<V: Sized + Copy>(&mut self, val: V) -> Addr {
-        let (addr, slice) = self.allocate(mem::size_of::<V>());
-        unsafe {
-            ptr::write_unaligned(slice.as_mut_ptr() as *mut V, val)
-        }
-        addr
-    }
-
-    #[inline(always)]
-    pub fn get_mut_slice(&mut self, addr: Addr, len: usize) -> &mut [u8] {
-        self.pages[addr.page_id()]
-            .get_mut_slice(addr.page_local_addr(), len)
     }
 
     pub unsafe fn get_ptr(&self, addr: Addr) -> *const u8 {
@@ -129,6 +108,7 @@ impl Arena {
     }
 
 }
+
 
 #[cfg(test)]
 mod tests {
